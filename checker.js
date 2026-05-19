@@ -11,10 +11,12 @@ const RESULTS_PATH = path.resolve(__dirname, "results.json");
 const LOG_DIR = path.resolve(__dirname, "logs");
 const SCREENSHOT_DIR = path.resolve(__dirname, "debug-screenshots");
 const ACTIVITY_LOG = path.join(LOG_DIR, "activity.log");
-const ERROR_LOG = path.join(LOG_DIR, "errors.log");
+const ERROR_LOG = path.join(LOG_DIR, "error.log");
 const IUMS_URL = process.env.IUMS_URL || "https://your-iums-url.com";
 const IUMS_RESULTS_URL =
   process.env.IUMS_RESULTS_URL || "https://your-iums-url.com/results";
+const RUN_ONCE =
+  process.env.RUN_ONCE === "true" || process.env.GITHUB_ACTIONS === "true";
 
 const SELECTORS = {
   username: process.env.IUMS_USERNAME_SELECTOR || "#username",
@@ -52,6 +54,21 @@ let cronTask = null;
 let currentBrowser = null;
 let lastCheckSuccessful = false;
 let shutdownInitiated = false;
+let lastSuccessAt = null;
+let hasLaunchedBefore = false;
+let heartbeatTimer = null;
+let activePage = null;
+
+// Cloud-safe Playwright launch settings for headless servers.
+const LAUNCH_OPTIONS = {
+  headless: true,
+  args: [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+  ],
+};
 
 function ensureDirs() {
   if (!fs.existsSync(LOG_DIR)) {
@@ -59,6 +76,12 @@ function ensureDirs() {
   }
   if (!fs.existsSync(SCREENSHOT_DIR)) {
     fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+  }
+  if (!fs.existsSync(ACTIVITY_LOG)) {
+    fs.closeSync(fs.openSync(ACTIVITY_LOG, "a"));
+  }
+  if (!fs.existsSync(ERROR_LOG)) {
+    fs.closeSync(fs.openSync(ERROR_LOG, "a"));
   }
 }
 
@@ -110,13 +133,25 @@ function loadResults() {
       })
       .filter((entry) => entry && entry.code && entry.title);
   } catch (error) {
-    console.error("[IUMS] Failed to parse results.json:", error.message || error);
+    const detail = error?.message || error;
+    console.error("[IUMS] Failed to parse results.json:", detail);
+    try {
+      const corruptedPath = `${RESULTS_PATH}.corrupt-${Date.now()}`;
+      fs.renameSync(RESULTS_PATH, corruptedPath);
+      console.error("[IUMS] Moved corrupted results.json to:", corruptedPath);
+    } catch (renameError) {
+      console.error("[IUMS] Failed to archive corrupted results.json:", renameError);
+    }
     return [];
   }
 }
 
 function saveResults(subjects) {
-  fs.writeFileSync(RESULTS_PATH, JSON.stringify(subjects, null, 2));
+  // Atomic write to avoid results.json corruption on crashes.
+  const tempPath = `${RESULTS_PATH}.tmp`;
+  const payload = JSON.stringify(subjects, null, 2);
+  fs.writeFileSync(tempPath, payload);
+  fs.renameSync(tempPath, RESULTS_PATH);
 }
 
 function shouldSkipRow(code, title) {
@@ -274,6 +309,11 @@ async function checkResults() {
     return;
   }
 
+  if (currentBrowser) {
+    log("Previous browser still detected. Cleaning up before new run.");
+    await safeCloseBrowser("pre-run cleanup");
+  }
+
   isRunning = true;
   log("Checking results...");
 
@@ -281,11 +321,22 @@ async function checkResults() {
   lastCheckSuccessful = false;
 
   try {
-    browser = await chromium.launch({ headless: false });
+    browser = await chromium.launch(LAUNCH_OPTIONS);
     currentBrowser = browser;
-    log("Browser started");
+    if (hasLaunchedBefore) {
+      log("Browser restarted");
+    } else {
+      log("Browser started");
+      hasLaunchedBefore = true;
+    }
+
+    browser.on("disconnected", () => {
+      log("Browser disconnected");
+      currentBrowser = null;
+    });
 
     const page = await browser.newPage();
+    activePage = page;
     await page.goto(IUMS_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
     await page.waitForLoadState("networkidle");
     log("Login page loaded");
@@ -375,14 +426,13 @@ async function checkResults() {
       log("Results updated", updatedResults);
     }
     lastCheckSuccessful = true;
+    lastSuccessAt = new Date();
+    log("Last successful check", lastSuccessAt.toISOString());
   } catch (error) {
     logError("Checker failed:", error);
   } finally {
-    if (browser) {
-      await browser.close();
-      log("Browser closed");
-    }
-    currentBrowser = null;
+    activePage = null;
+    await safeCloseBrowser("run cleanup", browser);
     isRunning = false;
   }
 }
@@ -392,12 +442,61 @@ function startScheduler() {
     log("Scheduler already running. Skipping duplicate start.");
     return;
   }
+  log("Scheduler active");
   log("Scheduler starting (every 10 minutes)");
   cronTask = cron.schedule("*/10 * * * *", () => {
     checkResults();
     const status = lastCheckSuccessful ? "last check successful" : "last check failed";
     log(`Bot alive | ${status}`);
   });
+}
+
+function startHeartbeat() {
+  if (heartbeatTimer) {
+    return;
+  }
+  // Periodic health logging to confirm long-running uptime.
+  heartbeatTimer = setInterval(() => {
+    log("Bot alive");
+    if (lastSuccessAt) {
+      log("Last successful check", lastSuccessAt.toISOString());
+    }
+  }, 30 * 60 * 1000);
+}
+
+async function safeCloseBrowser(reason, browserOverride) {
+  const target = browserOverride || currentBrowser;
+  if (!target) {
+    return;
+  }
+  try {
+    if (activePage && !activePage.isClosed()) {
+      await activePage.close({ runBeforeUnload: true });
+    }
+  } catch (error) {
+    logError(`Failed to close page during ${reason}:`, error);
+  }
+
+  try {
+    await target.close();
+    log(`Browser closed (${reason})`);
+  } catch (error) {
+    logError(`Failed to close browser during ${reason}:`, error);
+  } finally {
+    if (currentBrowser === target) {
+      currentBrowser = null;
+    }
+  }
+}
+
+async function handleFatalError(reason, error) {
+  logError(reason, error);
+  isRunning = false;
+  await safeCloseBrowser("fatal error cleanup");
+  process.exitCode = 1;
+  if (RUN_ONCE) {
+    process.exit(1);
+  }
 }
 
 async function shutdown(reason) {
@@ -413,29 +512,35 @@ async function shutdown(reason) {
     log("Scheduler stopped");
   }
 
-  if (currentBrowser) {
-    try {
-      await currentBrowser.close();
-      log("Browser closed during shutdown");
-    } catch (error) {
-      logError("Failed to close browser during shutdown:", error);
-    }
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
   }
+
+  await safeCloseBrowser("shutdown");
   process.exit(0);
 }
 
 process.on("uncaughtException", (error) => {
-  logError("Uncaught exception:", error);
+  handleFatalError("Uncaught exception:", error);
 });
 
 process.on("unhandledRejection", (error) => {
-  logError("Unhandled rejection:", error);
+  handleFatalError("Unhandled rejection:", error);
 });
 
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 ensureDirs();
-log("Bot starting up");
-startScheduler();
-checkResults();
+if (RUN_ONCE) {
+  log("Bot starting up (run once)");
+  checkResults()
+    .then(() => shutdown("run once complete"))
+    .catch((error) => handleFatalError("Run once failed:", error));
+} else {
+  log("Bot starting up");
+  startScheduler();
+  startHeartbeat();
+  checkResults();
+}
