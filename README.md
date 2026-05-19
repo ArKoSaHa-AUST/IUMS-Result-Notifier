@@ -149,3 +149,4 @@ pm2 delete iums-bot
 - Playwright runs headless on the server.
 - results.json stores previously detected courses.
 - Emails are only sent for newly detected courses.
+# IUMS-Result-Notifier
