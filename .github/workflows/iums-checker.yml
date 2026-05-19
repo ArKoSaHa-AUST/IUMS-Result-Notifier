@@ -10,6 +10,9 @@ on:
 jobs:
   run-checker:
     runs-on: ubuntu-latest
+    env:
+      # Opt in to Node.js 24 runtime for GitHub Actions.
+      FORCE_JAVASCRIPT_ACTIONS_NODE24: "true"
     steps:
       # Check out the repository so the workflow can run checker.js
       - name: Checkout repository
@@ -21,14 +24,21 @@ jobs:
         with:
           node-version: "20"
 
-      # Restore last results.json cache to prevent duplicate notifications
-      - name: Restore results cache
-        uses: actions/cache/restore@v4
+      # Cache results.json to prevent duplicate notifications between runs
+      - name: Cache results
+        uses: actions/cache@v4
         with:
           path: results.json
           key: iums-results-${{ github.run_id }}
           restore-keys: |
             iums-results-
+
+      # Ensure results.json exists so cache save does not fail
+      - name: Ensure results.json exists
+        run: |
+          if [ ! -f results.json ]; then
+            echo "[]" > results.json
+          fi
 
       # Install dependencies
       - name: Install dependencies
@@ -56,10 +66,3 @@ jobs:
           RUN_ONCE: "true"
         run: node checker.js
 
-      # Save updated results.json for the next run
-      - name: Save results cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: results.json
-          key: iums-results-${{ github.run_id }}
